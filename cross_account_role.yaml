@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WatchMyCloud integration - creates a read-only IAM role that allows
+  WatchMyCloud to read your cost data. You can delete this stack at
+  any time to revoke access.
+
+Parameters:
+  WatchMyCloudAccountId:
+    Type: String
+    Description: The AWS account ID of WatchMyCloud (do not change)
+    Default: '181474919476'
+
+  ExternalId:
+    Type: String
+    Description: Unique identifier for this connection (do not change)
+
+  CallbackUrl:
+    Type: String
+    Description: WatchMyCloud callback endpoint
+    # No default — connect-aws always passes the parameter from
+    # settings.connector_base_url. Removing the default means a stack
+    # launched with the bare template (e.g. via S3 URL share) refuses
+    # to deploy instead of silently calling back to a stale wrong host.
+    #
+    # Pattern pinned to our two production hosts (app + staging) — the
+    # template lives in a publicly readable S3 bucket, so without this
+    # someone could craft a stack URL that ships callbacks to an
+    # attacker host. Defence in depth: the SNS handler also verifies
+    # message signatures against AWS's signing cert before trusting
+    # the payload.
+    AllowedPattern: '^https://(app|staging)\.watchmy\.cloud/api/aws-callback$'
+    ConstraintDescription: Must be https://app.watchmy.cloud/api/aws-callback or https://staging.watchmy.cloud/api/aws-callback
+
+Resources:
+  WatchMyCloudRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'WatchMyCloud-CostReader-${ExternalId}'
+      Description: Read-only role for WatchMyCloud cost monitoring
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              # Tightened from `:root` so that only the connector's EC2
+              # instance role can assume customer roles — `:root`
+              # would have let ANY IAM principal in our account
+              # (e.g. a future Lambda, an engineer console role,
+              # a leaked dev IAM user) assume the customer's role as
+              # long as it knew the externalId. The externalId lives
+              # in our DB, ships in the launch URL, and lands in
+              # logs — defence-in-depth says it's a per-connection
+              # identifier, not a secret.
+              #
+              # Both prod and staging EC2 hosts share this same role
+              # (watchmycloud-ec2-role) — verified in
+              # infrastructure/terraform/envs/{prod,staging}/terraform.tfstate.
+              AWS: !Sub 'arn:aws:iam::${WatchMyCloudAccountId}:role/watchmycloud-ec2-role'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+      Policies:
+        - PolicyName: WatchMyCloudCostReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # The one call the product makes (shared/aws_client.py).
+                # Four unused reads were dropped: a reviewer should
+                # see nothing we don't need. Add an action here only with
+                # the code that calls it. Existing stacks keep the old
+                # grant until the customer updates them.
+                Action: 'ce:GetCostAndUsage'
+                Resource: '*'
+
+  # SNS topic to notify WatchMyCloud when the stack is ready
+  CallbackTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'WatchMyCloud-Callback-${ExternalId}'
+      Subscription:
+        - Protocol: https
+          Endpoint: !Ref CallbackUrl
+
+  # Custom resource that fires the SNS notification after role creation
+  CallbackNotification:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: WatchMyCloudRole
+    Properties:
+      ServiceToken: !Ref CallbackTopic
+      # Fail the stack after 5 min, not the 1 h default: when STS is briefly
+      # unreachable our callback answers 503 and lets SNS retry; if
+      # every retry fails the customer sees a failed stack while the
+      # onboarding screen (5 min timeout) still makes sense of it.
+      ServiceTimeout: '300'
+      role_arn: !GetAtt WatchMyCloudRole.Arn
+      external_id: !Ref ExternalId
+      account_id: !Ref 'AWS::AccountId'
+
+Outputs:
+  RoleArn:
+    Description: The ARN of the created role
+    Value: !GetAtt WatchMyCloudRole.Arn
+
+  ExternalId:
+    Description: The external ID for this connection
+    Value: !Ref ExternalId
