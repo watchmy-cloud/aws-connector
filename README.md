@@ -8,6 +8,8 @@ This is the CloudFormation template that connects your AWS account to [watchmy.c
 https://watchmycloud-cfn-templates.s3.eu-central-1.amazonaws.com/cross_account_role.yaml
 ```
 
+watchmy.cloud itself is a hosted service with a flat fee and a 30-day free trial. This repository holds only the role template, published so you can review exactly what it allows.
+
 ## What we can see
 
 We see money, split by service and by hour. That is all.
